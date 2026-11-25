@@ -8,15 +8,15 @@ from tempfile import TemporaryDirectory
 
 from intake.receive import receive_piece
 from intake.store import IntakeStore
-from issue.freeze import issue_revision
+from issue.freeze import issue_revision, issue_shift_summary, register_shift
 from issue.register import IssueRegister
 from issue.retrieve import retrieve_piece
 from ledger import open_database
 from protocol.catalog import build_catalog
 from protocol.revisions import RevisionStore, seal_revision
 from protocol.transitions import TransitionGraph, transition_from_record
-from review.history import read_report
-from review.publish import review_pair
+from review.history import read_report, read_shift_report
+from review.publish import review_pair, review_shift
 from review.store import ReportStore
 from runs.history import RunHistory
 from runs.import_run import record_run
@@ -118,16 +118,88 @@ def run_day_sample(root: Path) -> dict:
         }
 
 
+def _shift_rows(report):
+    return [[category, measured, str(expected), str(difference)]
+            for category, measured, expected, difference in report.rows]
+
+
+def run_shift_sample(root: Path) -> dict:
+    sample = json.loads((SAMPLES / 'shift_review.json').read_text(encoding='utf-8'))
+    center_path = root / 'shift-center.sqlite'
+    issued = {}
+    results = []
+    with closing(open_database(center_path)) as center:
+        intake, reports = _center(center)
+        with ExitStack() as stations:
+            handles = {}
+            for name, model in sample['models'].items():
+                site = model['site']
+                if site not in handles:
+                    source = stations.enter_context(
+                        closing(open_database(root / f"shift-station-{len(handles)}.sqlite")))
+                    handles[site] = _station(source, site)
+                revisions, history, register = handles[site]
+                revision_id = _seal_sample(revisions, model)
+                piece = issue_revision(register, revision_id)
+                issued[name] = {'history': history, 'register': register, 'revision_id': revision_id,
+                                'protocol_issue_id': piece.issue_id, 'raw': piece.raw}
+            for position, shift in enumerate(sample['shifts']):
+                handle = issued[shift['model']]
+                register, history = handle['register'], handle['history']
+                shift_id = register_shift(register, handle['protocol_issue_id'],
+                                          shift['rules'], shift['fallback'])
+                run_ids = [record_run(history, handle['revision_id'], codes).run_id
+                           for codes in shift['runs']]
+                summary = issue_shift_summary(register, shift_id, run_ids)
+                # The summary piece is received before its protocol piece; the
+                # binding is only checked when the shift report is signed.
+                summary_accepted = receive_piece(intake, summary.raw)
+                protocol_accepted = receive_piece(intake, handle['raw'])
+                signed = review_shift(reports, protocol_accepted.intake_id,
+                                      summary_accepted.intake_id)
+                actual = _shift_rows(signed)
+                _business_check(f'shift-{position}', shift['expected'], actual)
+                results.append({'shift_id': shift_id, 'report_id': signed.report_id,
+                                'receipt': signed.receipt, 'rows': actual,
+                                'parents': [asdict(parent) for parent in signed.parents]})
+    with closing(open_database(center_path)) as center:
+        _, reports = _center(center)
+        for result in results:
+            historical = read_shift_report(reports, result['report_id'])
+            _business_check(f"shift-reread-{result['report_id']}",
+                            [result['shift_id'], result['receipt'], result['rows']],
+                            [historical.shift_id, historical.receipt, _shift_rows(historical)])
+    return {
+        'case_id': 'shift_review',
+        'input': {'models': list(sample['models']),
+                  'shifts': [shift['runs'] for shift in sample['shifts']]},
+        'expected': [shift['expected'] for shift in sample['shifts']],
+        'actual': [result['rows'] for result in results],
+        'reports': [{'report_id': result['report_id'], 'shift_id': result['shift_id'],
+                     'receipt': result['receipt'], 'parents': result['parents']}
+                    for result in results],
+        'code_paths': ['issue/freeze.py', 'issue/shift_body.py', 'issue/shift_rules.py',
+                       'intake/receive.py', 'review/shift_expectation.py', 'review/publish.py',
+                       'review/store.py', 'review/history.py'],
+        'oracle': 'loop 规程的记录为 X^k 或 X^k Y，质量按 1/3 几何衰减，空记录为 1/3；'
+                  'overlap 规程经两条同码分支只生成 XXXY。期望数 = total × 该类精确终止概率，'
+                  '汇总件先于规程件实收，签报时核对绑定。',
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='海岚检测实验室规程复盘台账')
     parser.add_argument('command', choices=('demo',))
     parser.parse_args(argv)
     try:
         with TemporaryDirectory(prefix='hailan-review-') as directory:
-            evidence = run_day_sample(Path(directory))
+            root = Path(directory)
+            evidence = run_day_sample(root)
+            shift_evidence = run_shift_sample(root)
     except (ValueError, KeyError, sqlite3.Error, OSError) as error:
         parser.exit(1, f'{error}\n')
     print('POINTWISE_SCENARIO ' + json.dumps(evidence, ensure_ascii=False, sort_keys=True))
+    print('POINTWISE_SCENARIO ' + json.dumps(shift_evidence, ensure_ascii=False, sort_keys=True))
     return 0
 
 

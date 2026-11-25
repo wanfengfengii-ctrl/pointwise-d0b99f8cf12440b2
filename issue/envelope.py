@@ -14,6 +14,7 @@ class IssuedEnvelope:
     body_sha256: str
     body: bytes
     raw: bytes
+    version: int = 1
 
 
 def _unique_fields(pairs):
@@ -25,11 +26,13 @@ def _unique_fields(pairs):
     return fields
 
 
-def encode_envelope(site: str, issue_id: int, revision_id: int, body: bytes) -> bytes:
+def encode_envelope(site: str, issue_id: int, revision_id: int, body: bytes, version: int = 1) -> bytes:
     if type(body) is not bytes:
         raise ValueError('fixed body must be bytes')
+    if version not in (1, 2):
+        raise ValueError('unsupported fixed piece version')
     document = {
-        'version': 1, 'site': require_text(site, 'issuing site'), 'issue_id': record_id(issue_id),
+        'version': version, 'site': require_text(site, 'issuing site'), 'issue_id': record_id(issue_id),
         'revision_id': record_id(revision_id), 'body_sha256': sha256(body).hexdigest(),
         'body': body.decode('utf-8'),
     }
@@ -43,7 +46,8 @@ def decode_envelope(raw: bytes) -> IssuedEnvelope:
     fields = {'version', 'site', 'issue_id', 'revision_id', 'body_sha256', 'body'}
     if not isinstance(document, dict) or document.keys() != fields:
         raise ValueError('invalid fixed piece envelope fields')
-    if type(document['version']) is not int or document['version'] != 1:
+    version = document['version']
+    if type(version) is not int or version not in (1, 2):
         raise ValueError('unsupported fixed piece version')
     site = require_text(document['site'], 'issuing site')
     issue_id = record_id(document['issue_id'])
@@ -52,4 +56,4 @@ def decode_envelope(raw: bytes) -> IssuedEnvelope:
     digest = sha256(body).hexdigest()
     if document['body_sha256'] != digest:
         raise ValueError('fixed body digest mismatch')
-    return IssuedEnvelope(site, issue_id, revision_id, digest, body, raw)
+    return IssuedEnvelope(site, issue_id, revision_id, digest, body, raw, version)
